@@ -125,7 +125,7 @@ def fetch_season(year: int, season: str, theme_filter: Optional[str]) -> list[Th
             "page[number]": page,
         }
         if theme_filter:
-            params["filter[animethemes.type]"] = theme_filter.upper()
+            params["filter[animetheme][type]"] = theme_filter.upper()
 
         try:
             r = requests.get(
