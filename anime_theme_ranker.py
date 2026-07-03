@@ -79,6 +79,32 @@ REUPLOADER_CHANNELS = (
 # creditless-релізах OP/ED. Сильний позитивний сигнал.
 JP_PATTERNS = ("ノンクレジット", "tvアニメ", "creditless", "non-credit", "non credit")
 
+# Японські лапки 「...」 — стандартна позначка назви пісні в назвах
+# офіційних кліпів. Якщо назва там НЕ наша — це інша секвенція/чуже аніме.
+SONG_BRACKETS_RE = re.compile(r"「([^」]+)」")
+
+
+def _is_jp_script(s: str) -> bool:
+    """True якщо рядок переважно не-ASCII (kanji/hiragana/katakana).
+    Тоді fuzzy-порівняння з romaji-формою ненадійне (завжди ~0), і ми
+    не можемо обґрунтовано стверджувати "пісня інша".
+    """
+    if not s:
+        return False
+    non_ascii = sum(1 for c in s if ord(c) > 127)
+    return non_ascii > len(s) / 2
+
+# Маркери типу теми в назві відео. Якщо в кліпі стоїть протилежна
+# до нашої теми позначка (OP при ED або навпаки) — це не той кліп.
+OP_TYPE_MARKERS = ("オープニング", "ノンクレジットop", "op映像",
+                   "opテーマ", "opムービー", "opening")
+ED_TYPE_MARKERS = ("エンディング", "ノンクレジットed", "ed映像",
+                   "edテーマ", "edムービー", "ending")
+
+# Поріг якості: якщо найкращий кандидат набрав менше — краще "не знайдено",
+# ніж випадковий чужий кліп.
+SCORE_FLOOR = 4
+
 # Спецсимволи в іменах виконавців, що збивають YouTube-пошук:
 # SUPER★DRAGON, *Luna, ☆moefuwa☆ тощо. У нелапкованих запитах замінюємо на пробіл.
 _SPECIAL_CHARS_RE = re.compile(r"[★☆♪♥♡・×÷●○◆◇■□▲△▼▽※*]")
@@ -146,9 +172,11 @@ class Theme:
     def search_queries(self) -> list[tuple[str, int]]:
         """Стратегії пошуку: (запит, скільки результатів брати).
 
-        Спочатку йдуть JP-запити (якщо є японська назва) — вони точніше дістають
-        офіційні японські канали. Далі точний пошук пісня+виконавець у лапках,
-        потім більш загальні fallback'и.
+        Порядок важливий: ліміт у `search_youtube` зупиняє наступні запити,
+        коли вже зібрано достатньо кандидатів. Тому першим — точний пошук
+        пісня+виконавець у лапках: він мовно-нейтральний (знаходить і
+        японські, і будь-які інші офіційні релізи з цією піснею). Далі JP-
+        запити підкріплюють для випадків коли пошук скоріш мовозалежний.
         """
         type_word = "opening" if self.theme_type == "OP" else "ending"
         artist = self.artists[0] if self.artists else ""
@@ -169,24 +197,25 @@ class Theme:
                 seen.add(q.lower())
                 queries.append((q, count))
 
-        # 0. JP-запити — найсильніший хід для японських оригіналів.
-        #    Японські канали в назвах вживають ノンクレジット і ієрогліфи.
-        if self.anime_name_jp:
-            add(f"{self.anime_name_jp} ノンクレジット {self.theme_type}", 10)
-            if has_song:
-                add(f"{self.anime_name_jp} {self.song_title}", 5)
         # 1. Точний пошук "пісня" "виконавець" — найточніший варіант
         if has_song and artist:
             add(f'"{_q(self.song_title)}" "{_q(artist)}"', 15)
-        # 2. Без лапок (з очищеним артистом — ★ і подібне ламає YT-пошук)
+        # 2. JP-назва + пісня — ловить японські канали з ієрогліфічними назвами
+        if self.anime_name_jp and has_song:
+            add(f"{self.anime_name_jp} {self.song_title}", 5)
+        # 3. JP-назва + ノンクレジット — generic fallback для JP-каналів коли
+        #    точний запит не дав результатів (рідкі/нові пісні)
+        if self.anime_name_jp:
+            add(f"{self.anime_name_jp} ノンクレジット {self.theme_type}", 10)
+        # 4. Без лапок (з очищеним артистом — ★ і подібне ламає YT-пошук)
         if has_song and artist_clean:
             add(f"{self.song_title} {artist_clean}", 5)
-        # 3. Скорочена назва аніме + пісня
+        # 5. Скорочена назва аніме + пісня
         if has_song:
             add(f"{short} {self.song_title}", 5)
-        # 4. Скорочена назва + OP1/ED2 — типове позначення на каналах
+        # 6. Скорочена назва + OP1/ED2 — типове позначення на каналах
         add(f"{short} {self.theme_type}{seq}", 5)
-        # 5. Загальний запит з роком — відсікає старі компіляції
+        # 7. Загальний запит з роком — відсікає старі компіляції
         if self.year:
             add(f"{short} {type_word} {self.year}", 5)
         else:
@@ -331,8 +360,12 @@ def search_youtube(theme: Theme, delay: float = 1.5) -> None:
     type_word = "opening" if theme.theme_type == "OP" else "ending"
 
     # Debug-режим: збираємо всі скоринги для виведення в кінці.
+    # `--debug "X"` друкує для конкретного аніме завжди.
+    # `--debug-missing` друкує для будь-якої теми, що в кінці не знайшлась.
     debug_filter = (args_cache.get("debug") or "").strip()
     debug_active = bool(debug_filter) and debug_filter.lower() in (theme.anime_name or "").lower()
+    debug_missing = bool(args_cache.get("debug_missing"))
+    collect_debug = debug_active or debug_missing
     debug_rows: list[dict] = []
 
     try:
@@ -350,11 +383,16 @@ def search_youtube(theme: Theme, delay: float = 1.5) -> None:
                     if e and e.get("id") and e["id"] not in seen_ids:
                         seen_ids.add(e["id"])
                         all_entries.append(e)
-                # Достатньо кандидатів — наступні запити вже не потрібні
-                if len(all_entries) >= 15:
+                # Достатньо кандидатів — наступні запити вже не потрібні.
+                # 25 покриває: 15 з точного quoted + ~10 з JP-запитів —
+                # обидва типи джерел потрапляють у пул, навіть якщо точний
+                # дав 15 одразу.
+                if len(all_entries) >= 25:
                     break
 
         if not all_entries:
+            if collect_debug:
+                _print_debug_no_results(theme)
             return
 
         # Відкидаємо очевидно небажані за назвою; якщо нічого не лишилось —
@@ -441,10 +479,23 @@ def search_youtube(theme: Theme, delay: float = 1.5) -> None:
                 clip_bonus = 1 if (type_word in title_n or theme.theme_type.lower() in title_n) else 0
 
                 # ── Назва аніме у заголовку ────────────────────────────────
+                # JP-форма (якщо є): беремо "ядро" назви до японських
+                # роздільників (для "貴族転生〜...〜" це "貴族転生" — унікальний
+                # ідентифікатор аніме). Це найточніший збіг для японських каналів.
+                anime_bonus = 0
+                if theme.anime_name_jp:
+                    jp_core = theme.anime_name_jp
+                    for sep in ("〜", "～", "：", " "):
+                        if sep in jp_core:
+                            jp_core = jp_core.split(sep, 1)[0].strip()
+                            break
+                    raw_title = full.get("title") or ""
+                    if jp_core and len(jp_core) >= 2 and jp_core in raw_title:
+                        anime_bonus = 2
+                # Романізована форма — підкріплення або fallback
                 # Для коротких назв (≤5 симв.) — потрібен word boundary, щоб
                 # "Go" не матчилось у "Dragon Ball". Для довших — fuzzy ОК.
-                anime_bonus = 0
-                if anime_n and len(anime_n) >= 3:
+                if anime_bonus == 0 and anime_n and len(anime_n) >= 3:
                     needle = anime_n[:14]
                     if len(needle) <= 5:
                         if re.search(rf"\b{re.escape(needle)}\b", title_n):
@@ -468,11 +519,55 @@ def search_youtube(theme: Theme, delay: float = 1.5) -> None:
                 else:
                     off_bonus = 0
 
+                raw_title    = full.get("title") or ""
+                raw_title_l  = raw_title.lower()
+
+                # ── Назва пісні в японських лапках 「曲名」 у заголовку ──────
+                # Якщо в дужках стоїть пісня, відмінна від нашої — це ІНША
+                # секвенція OP/ED того ж аніме (або взагалі чуже аніме).
+                # АЛЕ: AnimeThemes завжди дає romaji ("Wakaba no Koro"), а
+                # японські канали часто пишуть пісню kanji/kana («若葉のころ»).
+                # У такому разі fuzzy-порівняння завжди ~0 — ми не маємо
+                # права штрафувати, бо це може бути та ж пісня в іншому
+                # скрипті. Скидаємо penalty якщо ВСІ дужки — JP-script.
+                bracket_songs = SONG_BRACKETS_RE.findall(raw_title)
+                song_brackets_present = bool(bracket_songs) and has_song
+                song_brackets_match = song_brackets_present and any(
+                    fuzz.partial_ratio(norm(bs), song_n) >= 75 for bs in bracket_songs
+                )
+                song_brackets_unverifiable = song_brackets_present and all(
+                    _is_jp_script(bs) for bs in bracket_songs
+                )
+                song_mismatch_penalty = (
+                    -4 if (song_brackets_present
+                           and not song_brackets_match
+                           and not song_brackets_unverifiable) else 0
+                )
+
+                # ── Тип теми (OP vs ED) у назві ─────────────────────────────
+                # Якщо наша тема ED, а в назві стоїть オープニング/OP映像 — це
+                # явно OP-кліп. Штрафуємо. (І навпаки.)
+                opp_markers  = ED_TYPE_MARKERS if theme.theme_type == "OP" else OP_TYPE_MARKERS
+                same_markers = OP_TYPE_MARKERS if theme.theme_type == "OP" else ED_TYPE_MARKERS
+                opposite_present = any(m in raw_title_l for m in opp_markers)
+                same_present     = any(m in raw_title_l for m in same_markers)
+                type_mismatch_penalty = -5 if (opposite_present and not same_present) else 0
+
                 # ── JP-патерн у назві (creditless / ノンクレジット / TVアニメ) ─
-                # Перевіряємо на сирому title, бо norm() через NFKC може
-                # торкнутися ширини символів і поламати збіг з 'tvアニメ'.
-                raw_title_l = (full.get("title") or "").lower()
-                jp_pattern_bonus = 3 if any(p in raw_title_l for p in JP_PATTERNS) else 0
+                # Цей патерн є на ВСІХ офіційних creditless-кліпах, тому сам
+                # по собі він не підтверджує "це наше аніме". Бонус даємо лише
+                # якщо назва нашого аніме теж у заголовку, І пісня (якщо
+                # вказана в дужках) — наша. Інакше штрафуємо.
+                jp_pattern_present = any(p in raw_title_l for p in JP_PATTERNS)
+                if not jp_pattern_present:
+                    jp_pattern_bonus = 0
+                elif anime_bonus == 0:
+                    jp_pattern_bonus = -5    # creditless ЧУЖОГО аніме
+                elif (song_brackets_present and not song_brackets_match
+                      and not song_brackets_unverifiable):
+                    jp_pattern_bonus = -3    # creditless нашого аніме, ІНША пісня
+                else:
+                    jp_pattern_bonus = 3     # creditless нашого аніме, наша пісня
 
                 # ── Свіжість завантаження ──────────────────────────────────
                 # OP-кліп сезону завантажують ~у вікні самого сезону. Якщо
@@ -494,17 +589,18 @@ def search_youtube(theme: Theme, delay: float = 1.5) -> None:
 
                 total = (song_bonus + artist_bonus + dur_bonus
                          + clip_bonus + anime_bonus + off_bonus
-                         + jp_pattern_bonus + recency_bonus)
+                         + jp_pattern_bonus + recency_bonus
+                         + song_mismatch_penalty + type_mismatch_penalty)
 
                 # Якщо score низький — views не повинні витягувати кандидата
                 # вгору (вірусний кавер не має обігнати тихий офіційний кліп).
-                tiebreaker = views if total >= 4 else 0
+                tiebreaker = views if total >= SCORE_FLOOR else 0
                 score = (total, tiebreaker)
 
-                if debug_active:
+                if collect_debug:
                     debug_rows.append({
                         "id": full.get("id"),
-                        "title": (full.get("title") or "")[:55],
+                        "title": raw_title[:55],
                         "channel": (full.get("channel") or "")[:22],
                         "duration": duration,
                         "views": views,
@@ -516,6 +612,8 @@ def search_youtube(theme: Theme, delay: float = 1.5) -> None:
                         "off": off_bonus,
                         "jp": jp_pattern_bonus,
                         "rec": recency_bonus,
+                        "smis": song_mismatch_penalty,
+                        "tmis": type_mismatch_penalty,
                         "total": total,
                     })
 
@@ -523,18 +621,43 @@ def search_youtube(theme: Theme, delay: float = 1.5) -> None:
                     best_score = score
                     best = full
 
-        if best:
+        # Поріг якості: якщо найкращий кандидат не набрав мінімум — краще
+        # лишити "не знайдено", ніж призначити випадковий чужий кліп.
+        if best and best_score[0] >= SCORE_FLOOR:
             theme.yt_url   = f"https://youtube.com/watch?v={best.get('id', '')}"
             theme.yt_views = best.get("view_count")
             theme.yt_title = best.get("title")
+        else:
+            best = None  # для debug-таблиці: позначити, що ніхто не пройшов
 
-        if debug_active:
+        # Друкуємо таблицю якщо: 1) явно вказано це аніме через --debug;
+        # 2) увімкнено --debug-missing і саме ця тема не знайшлась.
+        if debug_active or (debug_missing and best is None):
             _print_debug_table(theme, debug_rows, best.get("id") if best else None)
 
     except Exception:
         pass
 
     time.sleep(delay)
+
+
+def _print_debug_no_results(theme: Theme) -> None:
+    """Друкує повідомлення для теми, де YouTube-пошук не повернув жодного відео.
+    Показує які саме запити пробували — щоб видно було чому пусто.
+    """
+    queries = theme.search_queries
+    if HAS_RICH:
+        console.print(
+            f"\n[yellow]🔧 debug · {theme.anime_name} · {theme.label}: "
+            f"YouTube не повернув жодного відео на жоден запит[/yellow]"
+        )
+        console.print("[dim]Спробовані запити:[/dim]")
+        for q, n in queries:
+            console.print(f"  [dim]• ytsearch{n}: {q}[/dim]")
+    else:
+        print(f"\n[debug] {theme.anime_name} {theme.label}: YT нічого не повернув")
+        for q, n in queries:
+            print(f"  • ytsearch{n}: {q}")
 
 
 def _print_debug_table(theme: Theme, rows: list[dict], chosen_id: Optional[str]) -> None:
@@ -558,8 +681,7 @@ def _print_debug_table(theme: Theme, rows: list[dict], chosen_id: Optional[str])
         )
         t.add_column("✓", width=1)
         t.add_column("Канал", min_width=14, max_width=22, style="cyan")
-        t.add_column("Назва", min_width=24, max_width=55)
-        t.add_column("dur", justify="right", width=4)
+        t.add_column("Назва", min_width=24, max_width=50)
         t.add_column("song", justify="right", width=4)
         t.add_column("art", justify="right", width=3)
         t.add_column("dur±", justify="right", width=4)
@@ -568,6 +690,8 @@ def _print_debug_table(theme: Theme, rows: list[dict], chosen_id: Optional[str])
         t.add_column("off", justify="right", width=3)
         t.add_column("jp", justify="right", width=3)
         t.add_column("rec", justify="right", width=3)
+        t.add_column("smis", justify="right", width=4)
+        t.add_column("tmis", justify="right", width=4)
         t.add_column("Σ", justify="right", style="bold yellow", width=4)
         t.add_column("Перегл.", justify="right", style="dim", width=10)
 
@@ -577,10 +701,10 @@ def _print_debug_table(theme: Theme, rows: list[dict], chosen_id: Optional[str])
             t.add_row(
                 mark,
                 r["channel"], r["title"],
-                str(r["duration"] or "—"),
                 str(r["song"]), str(r["artist"]), str(r["dur"]),
                 str(r["clip"]), str(r["anime"]), str(r["off"]),
                 str(r["jp"]), str(r["rec"]),
+                str(r["smis"]), str(r["tmis"]),
                 str(r["total"]),
                 _fmt_views(r["views"]),
                 style=row_style,
@@ -592,7 +716,8 @@ def _print_debug_table(theme: Theme, rows: list[dict], chosen_id: Optional[str])
             mark = "✓" if r["id"] == chosen_id else " "
             print(f"  {mark} total={r['total']:>3} song={r['song']} art={r['artist']} "
                   f"dur={r['dur']} clip={r['clip']} ani={r['anime']} off={r['off']} "
-                  f"jp={r['jp']} rec={r['rec']} | {r['channel'][:20]} · {r['title'][:50]}")
+                  f"jp={r['jp']} rec={r['rec']} smis={r['smis']} tmis={r['tmis']} | "
+                  f"{r['channel'][:20]} · {r['title'][:50]}")
 
 
 # ─── HTML генератор ──────────────────────────────────────────────────────────
@@ -970,6 +1095,11 @@ def main():
                         help="Друкувати таблицю кандидатів зі скорами для аніме, "
                              "чия назва містить цей рядок (case-insensitive). "
                              "Наприклад: --debug \"Kizoku Tensei\"")
+    parser.add_argument("--debug-missing", action="store_true",
+                        help="Друкувати таблицю кандидатів для всіх тем, "
+                             "які не знайшлись на YouTube (best score < поріг "
+                             "або нічого не повернулось). Корисно щоб зрозуміти, "
+                             "ЧОМУ саме не знайшлось.")
     args = parser.parse_args()
 
     args_cache.update(vars(args))
